@@ -8,6 +8,7 @@ from opentelemetry.trace import Span, SpanKind, StatusCode, format_trace_id, for
 from opentelemetry.semconv.trace import SpanAttributes
 from opentelemetry.sdk.trace import ReadableSpan
 
+import sentry_sdk
 from sentry_sdk.utils import Dsn
 from sentry_sdk.consts import SPANSTATUS
 from sentry_sdk.tracing import get_span_status_from_http_code, DEFAULT_SPAN_ORIGIN
@@ -293,7 +294,8 @@ def get_trace_context(span, span_data=None):
     if span.attributes:
         trace_context["data"] = dict(span.attributes)
 
-    trace_context["dynamic_sampling_context"] = dsc_from_trace_state(span.context.trace_state)
+    trace_state = get_trace_state(span)
+    trace_context["dynamic_sampling_context"] = dsc_from_trace_state(trace_state)
 
     # TODO-neel-potel profiler thread_id, thread_name
 
@@ -327,3 +329,59 @@ def dsc_from_trace_state(trace_state):
             key = re.sub(Baggage.SENTRY_PREFIX_REGEX, "", k)
             dsc[key] = v
     return dsc
+
+
+def has_sentry_items_in_trace_state(trace_state):
+    # type: (TraceState) -> bool
+    for k in trace_state.keys():
+        if Baggage.SENTRY_PREFIX_REGEX.match(k):
+            return True
+    return False
+
+
+def get_trace_state(span):
+    # type: (Union[Span, ReadableSpan]) -> TraceState
+    """
+    Get the existing trace_state with sentry items
+    or populate it if we are the head SDK.
+    """
+    span_context = span.get_span_context()
+    if not span_context:
+        return TraceState()
+
+    trace_state = span_context.trace_state
+
+    if has_sentry_items_in_trace_state(trace_state):
+        return trace_state
+    else:
+        client = sentry_sdk.get_client()
+        if not client.is_active():
+            return trace_state
+
+        options = client.options or {}
+
+        trace_state = trace_state.update(
+            Baggage.SENTRY_PREFIX + quote("trace_id"),
+            format_trace_id(span_context.trace_id)
+        )
+
+        if options.get("environment"):
+            trace_state = trace_state.update(
+                Baggage.SENTRY_PREFIX + quote("environment"),
+                options["environment"]
+            )
+
+        if options.get("release"):
+            trace_state = trace_state.update(
+                Baggage.SENTRY_PREFIX + quote("release"),
+                options["release"]
+            )
+
+        if options.get("dsn"):
+            trace_state = trace_state.update(
+                Baggage.SENTRY_PREFIX + quote("public_key"),
+                Dsn(options["dsn"]).public_key
+            )
+
+         # TODO-neel-potel head dsc tx name, sample_rate, sampled
+        return trace_state
